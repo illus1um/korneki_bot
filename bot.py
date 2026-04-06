@@ -320,7 +320,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         key = data.split(":", 1)[1]
         section = LAW_SECTIONS.get(key)
         if section:
-            active_message = await show_section_text(callback.message, section["text"], lang, back_callback="cat:law")
+            active_message = await show_section_text(callback.message, section["text"][lang], lang, back_callback="cat:law")
             await set_active_menu(state, active_message)
         return
 
