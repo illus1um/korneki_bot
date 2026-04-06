@@ -225,13 +225,23 @@ async def start(message: Message, state: FSMContext) -> None:
     start_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🚀 Старт / Бастау", callback_data="open_languages")]]
     )
-    await send_or_edit_active_menu(message, state, INTRO_TEXT[lang], start_keyboard)
+    data = await state.get_data()
+    old_id = data.get(ACTIVE_MENU_ID_KEY)
+    if old_id:
+        await disable_keyboard(message.bot, message.chat.id, old_id)
+    sent = await message.answer(INTRO_TEXT[lang], reply_markup=start_keyboard)
+    await set_active_menu(state, sent)
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message, state: FSMContext) -> None:
     lang = await get_lang(state)
-    await send_or_edit_active_menu(message, state, UI_TEXT[lang]["choose_category"], categories_keyboard(lang))
+    data = await state.get_data()
+    old_id = data.get(ACTIVE_MENU_ID_KEY)
+    if old_id:
+        await disable_keyboard(message.bot, message.chat.id, old_id)
+    sent = await message.answer(UI_TEXT[lang]["choose_category"], reply_markup=categories_keyboard(lang))
+    await set_active_menu(state, sent)
 
 
 @dp.message(Command("help"))
