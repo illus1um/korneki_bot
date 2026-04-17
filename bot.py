@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 from data.bot_content import (
     CATEGORIES,
     CALL_CENTER_TEXT,
-    INTRO_TEXT,
     LAW_SECTIONS,
     SPECIALISTS_TEXT,
     TRANSLATIONS,
@@ -222,14 +221,11 @@ async def show_categories(message: Message, lang: str) -> None:
 @dp.message(Command("start"))
 async def start(message: Message, state: FSMContext) -> None:
     lang = await get_lang(state)
-    start_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🚀 Старт / Бастау", callback_data="open_languages")]]
-    )
     data = await state.get_data()
     old_id = data.get(ACTIVE_MENU_ID_KEY)
     if old_id:
         await disable_keyboard(message.bot, message.chat.id, old_id)
-    sent = await message.answer(INTRO_TEXT[lang], reply_markup=start_keyboard)
+    sent = await message.answer(UI_TEXT[lang]["choose_language"], reply_markup=language_keyboard())
     await set_active_menu(state, sent)
 
 
