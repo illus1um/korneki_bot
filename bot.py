@@ -11,9 +11,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
+from data.analytics import analytics, days_ago, lifespan
 from data.bot_content import (
     CATEGORIES,
     CALL_CENTER_TEXT,
+    CONTACTS,
     LAW_SECTIONS,
     SPECIALISTS_TEXT,
     TRANSLATIONS,
@@ -22,7 +24,38 @@ from data.bot_content import (
 
 DEFAULT_LANG = "ru"
 ACTIVE_MENU_ID_KEY = "active_menu_message_id"
+ADMIN_IDS: set[int] = set()
 dp = Dispatcher(storage=MemoryStorage())
+
+
+def _parse_admin_ids(raw: str | None) -> set[int]:
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.add(int(token))
+        except ValueError:
+            logging.warning("Ignoring non-integer ADMIN_IDS entry: %r", token)
+    return out
+
+
+async def track(
+    user_id: int,
+    event_type: str,
+    lang: str | None = None,
+    section_key: str | None = None,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    try:
+        await analytics.upsert_user(user_id, lang=lang, username=username, first_name=first_name)
+        await analytics.log_event(user_id, event_type, lang=lang, section_key=section_key)
+    except Exception:
+        logging.exception("Failed to record analytics event %s for user %s", event_type, user_id)
 
 
 async def get_lang(state: FSMContext) -> str:
@@ -196,7 +229,7 @@ def back_to_categories_keyboard(lang: str, back_callback: str = "nav:categories"
 def call_center_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💬 WhatsApp", url="https://wa.me/77751630000")],
+            [InlineKeyboardButton(text="💬 WhatsApp", url=CONTACTS["call_center_whatsapp_url"])],
             nav_row(lang, "nav:categories"),
         ]
     )
@@ -214,12 +247,20 @@ async def show_section_text(message: Message, text: str, lang: str, back_callbac
     return await message.answer(chunks[-1], reply_markup=keyboard)
 
 
-async def show_categories(message: Message, lang: str) -> None:
-    await safe_edit_text(message, UI_TEXT[lang]["choose_category"], reply_markup=categories_keyboard(lang))
+async def show_categories(message: Message, lang: str) -> Message:
+    return await safe_edit_text(message, UI_TEXT[lang]["choose_category"], reply_markup=categories_keyboard(lang))
+
+
+def _user_meta(message: Message) -> tuple[str | None, str | None]:
+    if message.from_user is None:
+        return None, None
+    return message.from_user.username, message.from_user.first_name
 
 
 @dp.message(Command("start"))
 async def start(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
     lang = await get_lang(state)
     data = await state.get_data()
     old_id = data.get(ACTIVE_MENU_ID_KEY)
@@ -227,10 +268,14 @@ async def start(message: Message, state: FSMContext) -> None:
         await disable_keyboard(message.bot, message.chat.id, old_id)
     sent = await message.answer(UI_TEXT[lang]["choose_language"], reply_markup=language_keyboard())
     await set_active_menu(state, sent)
+    username, first_name = _user_meta(message)
+    await track(message.from_user.id, "start", lang=lang, username=username, first_name=first_name)
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
     lang = await get_lang(state)
     data = await state.get_data()
     old_id = data.get(ACTIVE_MENU_ID_KEY)
@@ -238,16 +283,57 @@ async def menu(message: Message, state: FSMContext) -> None:
         await disable_keyboard(message.bot, message.chat.id, old_id)
     sent = await message.answer(UI_TEXT[lang]["choose_category"], reply_markup=categories_keyboard(lang))
     await set_active_menu(state, sent)
+    username, first_name = _user_meta(message)
+    await track(message.from_user.id, "menu", lang=lang, username=username, first_name=first_name)
 
 
 @dp.message(Command("help"))
 async def help_command(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
     lang = await get_lang(state)
     text_map: Dict[str, str] = {
         "ru": "Команды:\n/start - начать\n/menu - показать меню\n/help - помощь",
         "kz": "Командалар:\n/start - бастау\n/menu - мәзір\n/help - көмек",
     }
     await message.answer(text_map[lang])
+    await track(message.from_user.id, "help", lang=lang)
+
+
+@dp.message(Command("stats"))
+async def stats_command(message: Message) -> None:
+    if message.from_user is None or message.from_user.id not in ADMIN_IDS:
+        return
+
+    total = await analytics.total_users()
+    dau = await analytics.active_users_since(days_ago(1))
+    wau = await analytics.active_users_since(days_ago(7))
+    mau = await analytics.active_users_since(days_ago(30))
+    langs = await analytics.language_split()
+    top = await analytics.top_sections(
+        event_types=("category", "law_section", "translation_section"),
+        since=days_ago(30),
+        limit=10,
+    )
+
+    lines = [
+        "📊 Статистика бота",
+        f"Всего пользователей: {total}",
+        f"Активных за 24ч: {dau}",
+        f"Активных за 7д:  {wau}",
+        f"Активных за 30д: {mau}",
+        "",
+        "Языки: " + (", ".join(f"{k}={v}" for k, v in sorted(langs.items())) or "—"),
+        "",
+        "Топ разделов (30д):",
+    ]
+    if top:
+        for event_type, section_key, count in top:
+            lines.append(f"  {event_type}/{section_key}: {count}")
+    else:
+        lines.append("  (нет данных)")
+
+    await message.answer("\n".join(lines))
 
 
 @dp.callback_query()
@@ -261,37 +347,45 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     data = callback.data
     lang = await get_lang(state)
-
-    if data == "open_languages":
-        edited = await safe_edit_text(callback.message, UI_TEXT[lang]["choose_language"], reply_markup=language_keyboard())
-        await set_active_menu(state, edited)
-        return
+    user_id = callback.from_user.id if callback.from_user else None
+    username = callback.from_user.username if callback.from_user else None
+    first_name = callback.from_user.first_name if callback.from_user else None
 
     if data.startswith("lang:"):
         lang = data.split(":", 1)[1]
         await state.update_data(lang=lang)
-        await show_categories(callback.message, lang)
-        await set_active_menu(state, callback.message)
+        edited = await show_categories(callback.message, lang)
+        await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "lang_set", lang=lang, section_key=lang, username=username, first_name=first_name)
         return
 
     if data == "nav:languages":
         edited = await safe_edit_text(callback.message, UI_TEXT[lang]["choose_language"], reply_markup=language_keyboard())
         await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "nav", lang=lang, section_key="languages")
         return
 
     if data == "nav:categories":
-        await show_categories(callback.message, lang)
-        await set_active_menu(state, callback.message)
+        edited = await show_categories(callback.message, lang)
+        await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "nav", lang=lang, section_key="categories")
         return
 
     if data == "cat:law":
         edited = await safe_edit_text(callback.message, UI_TEXT[lang]["choose_law_subcategory"], reply_markup=law_keyboard(lang))
         await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "category", lang=lang, section_key="law")
         return
 
     if data == "cat:call_center":
         edited = await safe_edit_text(callback.message, CALL_CENTER_TEXT[lang], reply_markup=call_center_keyboard(lang))
         await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "category", lang=lang, section_key="call_center")
         return
 
     if data == "cat:translations":
@@ -301,6 +395,8 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=translations_keyboard(lang),
         )
         await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "category", lang=lang, section_key="translations")
         return
 
     if data == "cat:specialists":
@@ -310,6 +406,8 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=back_to_categories_keyboard(lang),
         )
         await set_active_menu(state, edited)
+        if user_id is not None:
+            await track(user_id, "category", lang=lang, section_key="specialists")
         return
 
     if data.startswith("law:"):
@@ -318,6 +416,8 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         if section:
             active_message = await show_section_text(callback.message, section["text"][lang], lang, back_callback="cat:law")
             await set_active_menu(state, active_message)
+            if user_id is not None:
+                await track(user_id, "law_section", lang=lang, section_key=key)
         return
 
     if data.startswith("tr:"):
@@ -326,6 +426,8 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         if section:
             active_message = await show_section_text(callback.message, section["text"], lang, back_callback="cat:translations")
             await set_active_menu(state, active_message)
+            if user_id is not None:
+                await track(user_id, "translation_section", lang=lang, section_key=key)
         return
 
 
@@ -335,16 +437,20 @@ async def main() -> None:
     if not token:
         raise RuntimeError("BOT_TOKEN is not set. Add it to .env or environment variables.")
 
+    global ADMIN_IDS
+    ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS"))
+
     logging.basicConfig(
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         level=logging.INFO,
     )
 
     bot = Bot(token=token)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    async with lifespan():
+        try:
+            await dp.start_polling(bot)
+        finally:
+            await bot.session.close()
 
 
 if __name__ == "__main__":
